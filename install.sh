@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Better Auto-Compact for Claude Code — Installer
-# https://github.com/jsvoboda/claude-better-compact
+# better-auto-compact for Claude Code — Installer
+# https://github.com/jsvoboda/better-auto-compact
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

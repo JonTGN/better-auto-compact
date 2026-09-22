@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Better Auto-Compact status line for Claude Code.
+ * better-auto-compact status line for Claude Code.
  *
  * Drop-in replacement for ctx_monitor.js that adds a compact countdown.
  * Installed by install.sh → referenced in ~/.claude/settings.json.
@@ -8,7 +8,7 @@
  * Reads the same stdin format as ctx_monitor.js:
  *   { session_id, transcript_path, model, cost }
  *
- * Also reads ~/.claude/better-compact/compact-state.json for countdown data
+ * Also reads ~/.claude/better-auto-compact/compact-state.json for countdown data
  * written by the background daemon.
  */
 
@@ -28,7 +28,7 @@ const CONTEXT_WINDOW_DEFAULT = 200_000;
 const costUsd = `\x1b[31m$${(Number(input.cost?.total_cost_usd) || 0).toFixed(2)}\x1b[0m`;
 
 // ── State file ────────────────────────────────────────────────────────────────
-const STATE_FILE = path.join(os.homedir(), ".claude", "better-compact", "compact-state.json");
+const STATE_FILE = path.join(os.homedir(), ".claude", "better-auto-compact", "compact-state.json");
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 

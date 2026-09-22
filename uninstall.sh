@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Better Auto-Compact for Claude Code — Uninstaller
+# better-auto-compact for Claude Code — Uninstaller
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

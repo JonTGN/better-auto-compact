@@ -1,8 +1,8 @@
-# better-compact
+# better-auto-compact
 
 > *"Are you tired of burning through your corporate token limits because there's no convenient time to `/compact` your Claude agents before your ADHD kicks in and you start burning tokens from another agent?"*
 
-**Introducing better-compact.**
+**Introducing better-auto-compact.**
 
 The smarter auto-compact for Claude Code that watches for inactivity and compacts *for you* — so you can bounce between agents, grab a coffee, fall down a rabbit hole, and come back to a fresh context window instead of a flaming token bill.
 
@@ -62,8 +62,8 @@ In tmux, switching back to a Claude Code pane also resets the timer — no extra
 ## Install
 
 ```bash
-git clone https://github.com/jsvoboda/claude-better-compact.git
-cd claude-better-compact
+git clone https://github.com/jsvoboda/better-auto-compact.git
+cd better-auto-compact
 chmod +x install.sh uninstall.sh
 ./install.sh
 ```
@@ -79,8 +79,8 @@ Hit Enter twice to go with the defaults and you're done.
 
 ### What gets changed
 
-1. `src/better_compact.py` + `src/statusline.js` → copied to `~/.claude/better-compact/src/`
-2. Your preferences → `~/.claude/better-compact/config.json`
+1. `src/better_compact.py` + `src/statusline.js` → copied to `~/.claude/better-auto-compact/src/`
+2. Your preferences → `~/.claude/better-auto-compact/config.json`
 3. Two hooks added to `~/.claude/settings.json`:
    - **`Stop`** — records session info, shows compact status in Claude's context
    - **`PreToolUse`** — resets the inactivity clock on tool use
@@ -90,7 +90,7 @@ Hit Enter twice to go with the defaults and you're done.
 
 ## Configuration
 
-Edit `~/.claude/better-compact/config.json` any time — changes apply within 10 seconds, no restart needed:
+Edit `~/.claude/better-auto-compact/config.json` any time — changes apply within 10 seconds, no restart needed:
 
 ```json
 {
@@ -139,7 +139,7 @@ The context window size is read directly from Claude Code — accurate for every
 ## Check Status
 
 ```bash
-python3 ~/.claude/better-compact/src/better_compact.py status
+python3 ~/.claude/better-auto-compact/src/better_compact.py status
 ```
 
 ```
@@ -159,11 +159,11 @@ Better Auto-Compact — Status
 
 ## Daemon
 
-Starts automatically on your first Claude response of a session. It can also pick up sessions that were already running before install — no need to restart existing sessions. Exits itself after 10 minutes of no active sessions. Logs at `~/.claude/better-compact/daemon.log`.
+Starts automatically on your first Claude response of a session. It can also pick up sessions that were already running before install — no need to restart existing sessions. Exits itself after 10 minutes of no active sessions. Logs at `~/.claude/better-auto-compact/daemon.log`.
 
 Force-stop it:
 ```bash
-kill $(cat ~/.claude/better-compact/daemon.pid)
+kill $(cat ~/.claude/better-auto-compact/daemon.pid)
 ```
 
 ---
@@ -181,20 +181,20 @@ Stops the daemon, removes the hooks, restores your original status line, deletes
 ## Troubleshooting
 
 **Compact isn't firing**
-- Check `~/.claude/better-compact/daemon.log`
+- Check `~/.claude/better-auto-compact/daemon.log`
 - Run `status` command above — if daemon is stopped, open a new Claude Code session to restart it
 - Make sure `tmux` is available: `which tmux`
 
 **Status line shows stale countdown**
 - The daemon writes state every 10s — give it a moment
-- Check `~/.claude/better-compact/compact-state.json` exists and has your session ID
+- Check `~/.claude/better-auto-compact/compact-state.json` exists and has your session ID
 
 **`python3` not found**
 - Install Python 3, or edit the hook commands in `~/.claude/settings.json` to use the full path (e.g. `/usr/local/bin/python3`)
 
 **Status line broke**
 ```bash
-cat ~/.claude/settings.json | python3 -c "import sys,json; s=json.load(sys.stdin); print(s.get('_bc_statusline_backup', 'no backup found'))"
+cat ~/.claude/settings.json | python3 -c "import sys,json; s=json.load(sys.stdin); print(s.get('_bac_statusline_backup', 'no backup found'))"
 ```
 Copy the output back into `"statusLine"` in `settings.json`.
 

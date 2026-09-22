@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Better Auto-Compact for Claude Code
-https://github.com/jsvoboda/claude-better-compact
+https://github.com/jsvoboda/better-auto-compact
 
 Monitors Claude Code sessions for inactivity using the native session JSON
 files that Claude Code writes to ~/.claude/sessions/. Auto-compacts when:
@@ -29,7 +29,7 @@ import glob
 from pathlib import Path
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
-BASE_DIR = Path.home() / ".claude" / "better-compact"
+BASE_DIR = Path.home() / ".claude" / "better-auto-compact"
 SESSIONS_DIR = Path.home() / ".claude" / "sessions"   # written by Claude Code
 CONFIG_FILE = BASE_DIR / "config.json"
 TRANSCRIPT_DIR = BASE_DIR / "transcripts"              # session_id -> transcript path
@@ -830,8 +830,8 @@ def _update_settings(settings_file: Path, installed_script: Path, statusline_scr
             "hooks": [{"type": "command", "command": pre_cmd}],
         })
 
-    if "statusLine" in settings and "_bc_statusline_backup" not in settings:
-        settings["_bc_statusline_backup"] = settings["statusLine"]
+    if "statusLine" in settings and "_bac_statusline_backup" not in settings:
+        settings["_bac_statusline_backup"] = settings["statusLine"]
     settings["statusLine"] = {
         "type": "command",
         "command": f"node {statusline_script}",
@@ -862,12 +862,12 @@ def _remove_from_settings(settings_file: Path, installed_script: Path):
                 new_entries.append({**entry, "hooks": filtered})
         hooks[event] = new_entries
 
-    backup = settings.pop("_bc_statusline_backup", None)
+    backup = settings.pop("_bac_statusline_backup", None)
     if backup is not None:
         settings["statusLine"] = backup
     elif "statusLine" in settings:
         sl = settings.get("statusLine", {})
-        if "better-compact" in sl.get("command", ""):
+        if "better-auto-compact" in sl.get("command", ""):
             del settings["statusLine"]
 
     settings_file.write_text(json.dumps(settings, indent=2))
@@ -876,7 +876,7 @@ def _remove_from_settings(settings_file: Path, installed_script: Path):
 
 def install_main():
     print()
-    print("Better Auto-Compact for Claude Code")
+    print("better-auto-compact for Claude Code")
     print("=" * 40)
     print()
 
