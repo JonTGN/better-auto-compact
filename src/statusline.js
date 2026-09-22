@@ -198,6 +198,19 @@ const CONTEXT_WINDOW = Number(input.context_window?.context_window_size) || CONT
 const used = usedTotal(usage);
 const pct = CONTEXT_WINDOW > 0 ? Math.round((used * 1000) / CONTEXT_WINDOW) / 10 : 0;
 
+// Write authoritative context data for the daemon so it never falls back to wrong window size.
+// The daemon reads this first (< 60s old) before touching the transcript.
+if (sessionId) {
+  const slDir = path.join(os.homedir(), ".claude", "better-auto-compact", "statusline");
+  try {
+    fs.mkdirSync(slDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(slDir, `${sessionId}.json`),
+      JSON.stringify({ context_pct: pct, tokens_used: used, context_window: CONTEXT_WINDOW, updated: Date.now() / 1000 })
+    );
+  } catch {}
+}
+
 const usagePercentLabel = `${color(pct)}context used ${pct.toFixed(1)}%\x1b[0m`;
 const usageCountLabel = `\x1b[33m(${comma(used)}/${comma(CONTEXT_WINDOW)})\x1b[0m`;
 const countdown = compactCountdownLabel(pct);

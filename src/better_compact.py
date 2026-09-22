@@ -615,14 +615,28 @@ def daemon_tick(config: dict) -> bool:
         if not session_id or not pid:
             continue
 
-        # Get transcript path — prefer Stop hook recording, fall back to inferred path
-        transcript_path_str = read_file(TRANSCRIPT_DIR / session_id)
-        tp = Path(transcript_path_str) if transcript_path_str else infer_transcript_path(session)
-        ctx_win_str = read_file(TRANSCRIPT_DIR / f"{session_id}.ctxwin")
-        ctx_win = int(ctx_win_str) if ctx_win_str.isdigit() else 0
+        # Prefer statusline cache (written by statusline.js from Claude Code's own stdin —
+        # authoritative context window size, updated every status poll).
+        # Fall back to transcript parsing when cache is absent or stale (> 60s).
         context_pct, tokens_used = 0.0, 0
-        if tp and tp.exists():
-            context_pct, tokens_used = get_context_from_transcript(tp, ctx_win)
+        sl_cache = BASE_DIR / "statusline" / f"{session_id}.json"
+        sl_used = False
+        try:
+            sl = json.loads(sl_cache.read_text())
+            if time.time() - sl.get("updated", 0) < 60:
+                context_pct = float(sl.get("context_pct", 0))
+                tokens_used = int(sl.get("tokens_used", 0))
+                sl_used = True
+        except Exception:
+            pass
+
+        if not sl_used:
+            transcript_path_str = read_file(TRANSCRIPT_DIR / session_id)
+            tp = Path(transcript_path_str) if transcript_path_str else infer_transcript_path(session)
+            ctx_win_str = read_file(TRANSCRIPT_DIR / f"{session_id}.ctxwin")
+            ctx_win = int(ctx_win_str) if ctx_win_str.isdigit() else 0
+            if tp and tp.exists():
+                context_pct, tokens_used = get_context_from_transcript(tp, ctx_win)
 
         idle_secs = idle_seconds(session)
         countdown_secs = max(0.0, timeout_secs - idle_secs)
