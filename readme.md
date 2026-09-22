@@ -28,22 +28,23 @@ You walk away. It handles it. You come back to breathing room.
 
 ## How It Works
 
-1. **Stop hook** fires after every Claude response → records your session + tmux pane
-2. **Background daemon** polls every 10s → checks real context % (same math as your status bar) against your threshold
-3. Session idle long enough? **`/compact` sent automatically** via tmux
-4. **Status line** shows a live countdown: `⏱ compact in 3m 22s` — yellow, then red as it closes in
+1. **Background daemon** polls every 10s → reads `~/.claude/sessions/*.json` (files Claude Code writes itself) to check every live session's native `status` field
+2. When `status == "idle"` AND idle for longer than your timeout AND context above threshold → **`/compact` sent automatically** via the tmux pane ID that's also in that JSON
+3. **Status line** shows a live countdown: `⏱ compact in 3m 22s` — yellow, then red as it closes in
 
-### What counts as "active"
+### Activity detection — using Claude Code's own status
 
-| Signal | Resets timer? |
-|---|---|
-| You send a message | ✅ Yes |
-| Claude uses a tool | ✅ Yes |
-| You focus the tmux pane | ✅ Yes (optional one-liner) |
-| Typing before hitting Enter | ❌ No — transcript updates on submit |
-| Scrolling | ❌ No |
+Claude Code natively writes a `status` field to its session JSON in real time:
 
-The big one — *did you actually send a message* — is always caught. The typing gap is tiny in practice.
+| What you do | Claude Code status | Timer |
+|---|---|---|
+| You send a message | `"busy"` | ✅ Resets (idle clock restarts when it goes idle again) |
+| You're typing (not yet submitted) | `"idle"` | Timer still running |
+| Claude is responding | `"busy"` | ✅ Resets |
+| Claude uses a tool | `"busy"` or `"shell"` | ✅ Resets |
+| Window focus / scroll | `"idle"` | Timer still running |
+
+**The practically important case — did you actually send a message — is fully covered.** The "typing before submit" gap exists technically but can't cause an unwanted compact with any reasonable timeout (nobody types for 5+ minutes without submitting). The moment you hit Enter the status flips to `"busy"` and the idle clock restarts from zero.
 
 ---
 

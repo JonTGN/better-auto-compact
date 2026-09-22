@@ -3,15 +3,19 @@
 Better Auto-Compact for Claude Code
 https://github.com/jsvoboda/claude-better-compact
 
-Monitors sessions for inactivity and auto-compacts when context exceeds
-a configured threshold. Runs as a background daemon, started by Claude
-Code's Stop hook.
+Monitors Claude Code sessions for inactivity using the native session JSON
+files that Claude Code writes to ~/.claude/sessions/. Auto-compacts when:
+  1. Session status is "idle" (not busy/responding/tool-running)
+  2. Has been idle longer than the configured timeout
+  3. Context usage exceeds the configured threshold
 
 Usage (invoked by Claude Code hooks + install script):
   better_compact.py stop-hook       # Claude Code Stop event (stdin: JSON)
   better_compact.py pre-tool-hook   # Claude Code PreToolUse event (stdin: JSON)
   better_compact.py daemon          # Background daemon process
   better_compact.py status          # Show current status
+  better_compact.py install         # Interactive install
+  better_compact.py uninstall       # Remove everything
 """
 
 import sys
@@ -21,24 +25,35 @@ import time
 import signal
 import shutil
 import subprocess
+import glob
 from pathlib import Path
-from datetime import datetime, timezone
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 BASE_DIR = Path.home() / ".claude" / "better-compact"
+SESSIONS_DIR = Path.home() / ".claude" / "sessions"   # written by Claude Code
 CONFIG_FILE = BASE_DIR / "config.json"
-SESSIONS_DIR = BASE_DIR / "sessions"
+TRANSCRIPT_DIR = BASE_DIR / "transcripts"              # session_id -> transcript path
 STATE_FILE = BASE_DIR / "compact-state.json"
 DAEMON_PID_FILE = BASE_DIR / "daemon.pid"
 LOG_FILE = BASE_DIR / "daemon.log"
 
-CONTEXT_WINDOW = 200_000  # tokens (current Claude models)
+CONTEXT_WINDOW_DEFAULT = 200_000
+CONTEXT_WINDOW_1M = 1_048_576
+
+
+def context_window_for_model(model_id: str) -> int:
+    """Return the context window size for a given model ID."""
+    m = (model_id or "").lower()
+    if "1m" in m or "1048576" in m:
+        return CONTEXT_WINDOW_1M
+    return CONTEXT_WINDOW_DEFAULT
 
 DEFAULT_CONFIG = {
     "inactivity_timeout_minutes": 5,
     "compact_threshold_percent": 70,
     "version": "1.0.0",
 }
+
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
@@ -68,7 +83,95 @@ def read_file(path: Path, default: str = "") -> str:
         return default
 
 
-# ── Context calculation (mirrors ctx_monitor.js logic exactly) ─────────────────
+# ── Session JSON reading (Claude Code native) ─────────────────────────────────
+
+def read_session_json(pid: int):
+    """Read ~/.claude/sessions/<pid>.json - written by Claude Code itself."""
+    j = SESSIONS_DIR / f"{pid}.json"
+    try:
+        return json.loads(j.read_text())
+    except Exception:
+        return None
+
+
+def infer_transcript_path(session: dict) -> Path:
+    """
+    Infer the transcript JSONL path from the session JSON without needing the Stop hook.
+    Claude Code stores transcripts at:
+      ~/.claude/projects/<cwd-with-/-replaced-by->/  <sessionId>.jsonl
+    """
+    cwd = session.get("cwd", "")
+    session_id = session.get("sessionId", "")
+    if not cwd or not session_id:
+        return Path("")
+    encoded = cwd.replace("/", "-")
+    return Path.home() / ".claude" / "projects" / encoded / f"{session_id}.jsonl"
+
+
+def find_all_sessions() -> list[dict]:
+    """Return all active Claude Code sessions from ~/.claude/sessions/*.json."""
+    sessions = []
+    try:
+        for p in SESSIONS_DIR.glob("*.json"):
+            try:
+                data = json.loads(p.read_text())
+                # Verify the process is actually still alive
+                pid = data.get("pid", 0)
+                if pid > 1:
+                    try:
+                        os.kill(pid, 0)
+                        sessions.append(data)
+                    except ProcessLookupError:
+                        pass  # Process dead, skip
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return sessions
+
+
+def _tmux_idle_seconds(session: dict) -> float:
+    """Seconds since last tmux pane activity (keypresses, scroll, etc.), or inf."""
+    tmux_info = session.get("tmux", "")
+    if not tmux_info or not shutil.which("tmux"):
+        return float("inf")
+    pane = tmux_info.split(".")[-1] if "." in tmux_info else ""
+    if not pane.startswith("%"):
+        return float("inf")
+    try:
+        r = subprocess.run(
+            ["tmux", "display-message", "-t", pane, "-p", "#{pane_last_used}"],
+            capture_output=True, text=True, timeout=2
+        )
+        ts = r.stdout.strip()
+        if ts and ts.isdigit():
+            return time.time() - int(ts)
+    except Exception:
+        pass
+    return float("inf")
+
+
+def idle_seconds(session: dict) -> float:
+    """
+    Return how long this session has been idle, in seconds.
+    Takes the minimum of:
+      1. Claude Code's native statusUpdatedAt (resets when any message is submitted)
+      2. tmux pane_last_used (resets on any keypress/scroll in tmux)
+      3. tty mtime (resets on any terminal I/O including user typing)
+    This means typing in the prompt box resets the countdown even without submitting.
+    """
+    if session.get("status") != "idle":
+        return 0.0
+    updated_ms = session.get("statusUpdatedAt", 0)
+    if not updated_ms:
+        return 0.0
+    claude_idle = (time.time() * 1000 - updated_ms) / 1000.0
+
+    candidates = [claude_idle, _tmux_idle_seconds(session)]
+    return min(candidates)
+
+
+# ── Context calculation (mirrors ctx_monitor.js exactly) ──────────────────────
 
 def _used_total(usage: dict) -> int:
     return (
@@ -79,10 +182,13 @@ def _used_total(usage: dict) -> int:
     )
 
 
-def get_context_from_transcript(transcript_path: Path) -> tuple[float, int]:
-    """Return (percent_used, tokens_used) from the transcript's newest assistant message."""
+def get_context_from_transcript(transcript_path: Path, ctx_window: int = 0) -> tuple[float, int]:
+    """Return (percent_used, tokens_used) from transcript's newest assistant message."""
+    from datetime import datetime
+
     latest_ts = -float("inf")
     latest_usage = None
+    latest_model = ""
 
     try:
         with open(transcript_path, encoding="utf-8") as f:
@@ -94,25 +200,20 @@ def get_context_from_transcript(transcript_path: Path) -> tuple[float, int]:
                     j = json.loads(line)
                 except Exception:
                     continue
-
                 msg = j.get("message", {})
                 if not msg:
                     continue
                 if j.get("isSidechain"):
                     continue
-                model_str = str(msg.get("model", "")).lower()
-                if "synthetic" in model_str:
+                if "synthetic" in str(msg.get("model", "")).lower():
                     continue
                 if j.get("isApiErrorMessage"):
                     continue
                 if msg.get("role") != "assistant":
                     continue
-
                 usage = msg.get("usage", {})
                 if not usage or _used_total(usage) == 0:
                     continue
-
-                # skip "no response requested" content
                 content = msg.get("content", [])
                 if isinstance(content, list) and any(
                     isinstance(b, dict)
@@ -121,9 +222,8 @@ def get_context_from_transcript(transcript_path: Path) -> tuple[float, int]:
                     for b in content
                 ):
                     continue
-
-                ts_str = j.get("timestamp", "")
                 ts = 0.0
+                ts_str = j.get("timestamp", "")
                 if ts_str:
                     try:
                         ts = datetime.fromisoformat(
@@ -131,14 +231,13 @@ def get_context_from_transcript(transcript_path: Path) -> tuple[float, int]:
                         ).timestamp()
                     except Exception:
                         pass
-
                 if ts > latest_ts or (
                     ts == latest_ts
                     and _used_total(usage) > _used_total(latest_usage or {})
                 ):
                     latest_ts = ts
                     latest_usage = usage
-
+                    latest_model = str(msg.get("model", ""))
     except Exception:
         return 0.0, 0
 
@@ -146,11 +245,12 @@ def get_context_from_transcript(transcript_path: Path) -> tuple[float, int]:
         return 0.0, 0
 
     used = _used_total(latest_usage)
-    pct = round((used * 1000) / CONTEXT_WINDOW) / 10.0 if CONTEXT_WINDOW > 0 else 0.0
+    win = ctx_window or context_window_for_model(latest_model)
+    pct = round((used * 1000) / win) / 10.0 if win > 0 else 0.0
     return min(pct, 100.0), used
 
 
-# ── State file ─────────────────────────────────────────────────────────────────
+# ── State file (read by statusline.js) ────────────────────────────────────────
 
 def load_state() -> dict:
     try:
@@ -169,6 +269,251 @@ def save_state(state: dict):
         tmp.rename(STATE_FILE)
     except Exception:
         pass
+
+
+# ── Compact trigger ────────────────────────────────────────────────────────────
+
+def _session_tty(pid: int) -> str:
+    """Return the controlling tty path for a process (e.g. '/dev/ttys041')."""
+    try:
+        r = subprocess.run(["ps", "-p", str(pid), "-o", "tty="],
+                           capture_output=True, text=True, timeout=3)
+        name = r.stdout.strip()
+        if name and name != "??":
+            return f"/dev/{name}" if not name.startswith("/") else name
+    except Exception:
+        pass
+    return ""
+
+
+def _compact_via_socket(session: dict) -> bool:
+    """
+    Try to send /compact via the messaging socket using the session key.
+    The key file is read at runtime (never logged). Returns True on success.
+
+    Protocol (reverse-engineered from extension source):
+      - Unix domain socket at messagingSocketPath
+      - Key file: ~/.claude/sessions/<pid>.<sha256>.key (600, owner-only)
+      - Auth: send JSON {"type":"auth","token":"<key_content>"} + newline
+      - Compact: send JSON {"type":"compact"} + newline
+      - Server responds to each message with JSON; silent on bad auth.
+    """
+    import socket as _sock
+
+    socket_path = session.get("messagingSocketPath", "")
+    pid = session.get("pid", 0)
+    if not socket_path or not pid:
+        return False
+
+    # Find the key file for this session
+    key_file = None
+    try:
+        for kf in SESSIONS_DIR.glob(f"{pid}.*.key"):
+            key_file = kf
+            break
+    except Exception:
+        return False
+    if not key_file:
+        return False
+
+    # Read key without logging its value
+    try:
+        key = key_file.read_text().strip()
+    except Exception:
+        return False
+
+    s = _sock.socket(_sock.AF_UNIX, _sock.SOCK_STREAM)
+    s.settimeout(5)
+    try:
+        s.connect(socket_path)
+
+        def send_msg(obj):
+            s.send((json.dumps(obj) + "\n").encode())
+
+        def recv_msg():
+            buf = b""
+            s.settimeout(2)
+            try:
+                while True:
+                    chunk = s.recv(4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    if b"\n" in buf:
+                        break
+            except _sock.timeout:
+                pass
+            return buf.decode(errors="replace").strip()
+
+        # Auth handshake — try a few common patterns since protocol is undocumented
+        send_msg({"type": "auth", "token": key})
+        auth_resp = recv_msg()
+        log(f"Socket auth response: {auth_resp[:100] if auth_resp else '(none)'}")
+
+        if not auth_resp:
+            # Try raw key as first line (some simple protocols just send the token)
+            s2 = _sock.socket(_sock.AF_UNIX, _sock.SOCK_STREAM)
+            s2.settimeout(5)
+            s2.connect(socket_path)
+            s2.send((key + "\n").encode())
+            import time; time.sleep(0.3)
+            try:
+                r = s2.recv(4096)
+                log(f"Raw key response: {r[:100]}")
+                if r:
+                    # Got a response — connected. Try compact.
+                    s2.send(json.dumps({"type": "compact"}).encode() + b"\n")
+                    time.sleep(0.5)
+                    return True
+            except _sock.timeout:
+                pass
+            finally:
+                s2.close()
+            return False
+
+        # If we got a response to auth, try sending compact
+        import time; time.sleep(0.2)
+        send_msg({"type": "compact"})
+        compact_resp = recv_msg()
+        log(f"Socket compact response: {compact_resp[:100] if compact_resp else '(none)'}")
+
+        # Any non-error response = success
+        if compact_resp and "error" not in compact_resp.lower():
+            log(f"Compact sent via socket for PID {pid}")
+            return True
+
+        return False
+    except Exception as e:
+        log(f"Socket compact error for PID {pid}: {e}")
+        return False
+    finally:
+        s.close()
+
+
+def _compact_via_applescript(pid: int, tty: str) -> bool:
+    """
+    On macOS without tmux, find the Terminal.app or iTerm2 tab running
+    this tty and send /compact to it. Returns True on success.
+    """
+    if sys.platform != "darwin" or not tty:
+        return False
+
+    tty_name = tty.replace("/dev/", "")
+
+    # Terminal.app
+    terminal_script = f"""
+tell application "Terminal"
+    repeat with w in windows
+        repeat with t in tabs of w
+            try
+                if tty of t contains "{tty_name}" then
+                    do script "/compact" in t
+                    return "ok"
+                end if
+            end try
+        end repeat
+    end repeat
+    return "not_found"
+end tell
+"""
+    try:
+        r = subprocess.run(["osascript", "-e", terminal_script],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode == 0 and "ok" in r.stdout:
+            log(f"Compact sent via Terminal.app (tty {tty_name})")
+            return True
+    except Exception:
+        pass
+
+    # iTerm2
+    iterm_script = f"""
+tell application "iTerm2"
+    repeat with w in windows
+        try
+            repeat with t in tabs of w
+                repeat with sess in sessions of t
+                    try
+                        if tty of sess contains "{tty_name}" then
+                            tell sess to write text "/compact"
+                            return "ok"
+                        end if
+                    end try
+                end repeat
+            end repeat
+        end try
+    end repeat
+    return "not_found"
+end tell
+"""
+    try:
+        r2 = subprocess.run(["osascript", "-e", iterm_script],
+                            capture_output=True, text=True, timeout=5)
+        if r2.returncode == 0 and "ok" in r2.stdout:
+            log(f"Compact sent via iTerm2 (tty {tty_name})")
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def trigger_compact(session: dict, context_pct: float) -> bool:
+    """
+    Send /compact to the session. Tries in order:
+      1. tmux send-keys (pane ID from native session JSON)
+      2. Messaging socket with session key auth
+      3. AppleScript (Terminal.app / iTerm2) matching by tty
+      4. System notification fallback
+    Returns True when the command was delivered or notification sent.
+    """
+    pid = session.get("pid", 0)
+
+    # ── 1. tmux ─────────────────────────────────────────────────────────────────
+    tmux_info = session.get("tmux", "")
+    if tmux_info and shutil.which("tmux"):
+        pane = tmux_info.split(".")[-1] if "." in tmux_info else ""
+        if pane.startswith("%"):
+            try:
+                result = subprocess.run(
+                    ["tmux", "send-keys", "-t", pane, "/compact", "Enter"],
+                    capture_output=True, timeout=5,
+                )
+                if result.returncode == 0:
+                    log(f"Compact via tmux pane {pane}")
+                    return True
+                log(f"tmux failed rc={result.returncode}")
+            except Exception as e:
+                log(f"tmux error: {e}")
+
+    # ── 2. Messaging socket ──────────────────────────────────────────────────────
+    if _compact_via_socket(session):
+        return True
+
+    # ── 3. AppleScript ───────────────────────────────────────────────────────────
+    tty = _session_tty(pid) if pid else ""
+    if tty and _compact_via_applescript(pid, tty):
+        return True
+
+    # ── 4. Notification fallback ─────────────────────────────────────────────────
+    msg = (
+        f"Claude Code context is {context_pct:.1f}% full "
+        f"(idle {idle_seconds(session):.0f}s). Run /compact to free space."
+    )
+    try:
+        if sys.platform == "darwin":
+            subprocess.run(
+                ["osascript", "-e",
+                 f'display notification "{msg}" with title "Better Compact" sound name "Ping"'],
+                capture_output=True, timeout=5,
+            )
+        else:
+            subprocess.run(["notify-send", "Better Compact", msg],
+                           capture_output=True, timeout=5)
+    except Exception:
+        pass
+
+    log(f"Compact notification sent for PID {pid} (no direct channel available)")
+    return True
 
 
 # ── Daemon management ──────────────────────────────────────────────────────────
@@ -192,10 +537,8 @@ def ensure_daemon_running():
     with open(LOG_FILE, "a") as log_fh:
         proc = subprocess.Popen(
             [sys.executable, str(script), "daemon"],
-            stdout=log_fh,
-            stderr=log_fh,
-            start_new_session=True,
-            close_fds=True,
+            stdout=log_fh, stderr=log_fh,
+            start_new_session=True, close_fds=True,
         )
     write_file(DAEMON_PID_FILE, str(proc.pid))
 
@@ -212,133 +555,15 @@ def log(message: str):
         pass
 
 
-# ── Compact trigger ────────────────────────────────────────────────────────────
-
-def trigger_compact(session_dir: Path, context_pct: float) -> bool:
-    """Send /compact to the Claude Code session. Returns True if handled."""
-    tmux_pane = read_file(session_dir / "tmux_pane")
-
-    if tmux_pane and shutil.which("tmux"):
-        try:
-            result = subprocess.run(
-                ["tmux", "send-keys", "-t", tmux_pane, "/compact", "Enter"],
-                capture_output=True,
-                timeout=5,
-            )
-            if result.returncode == 0:
-                log(f"Sent /compact to tmux pane {tmux_pane}")
-                return True
-            log(f"tmux send-keys failed (rc={result.returncode}): {result.stderr.decode()}")
-        except Exception as e:
-            log(f"tmux compact error: {e}")
-
-    # Fallback: system notification
-    msg = (
-        f"Context is {context_pct:.1f}% full and session has been inactive. "
-        "Run /compact in Claude Code to free space."
-    )
-    try:
-        if sys.platform == "darwin":
-            subprocess.run(
-                [
-                    "osascript",
-                    "-e",
-                    f'display notification "{msg}" with title "Better Compact" sound name "Ping"',
-                ],
-                capture_output=True,
-                timeout=5,
-            )
-        else:
-            subprocess.run(
-                ["notify-send", "Better Compact", msg],
-                capture_output=True,
-                timeout=5,
-            )
-    except Exception:
-        pass
-
-    return True
-
-
-# ── Daemon tick ────────────────────────────────────────────────────────────────
-
-def daemon_tick(config: dict) -> bool:
-    """Check all sessions. Returns True if at least one active session found."""
-    timeout_secs = config["inactivity_timeout_minutes"] * 60.0
-    threshold = config["compact_threshold_percent"]
-
-    if not SESSIONS_DIR.exists():
-        return False
-
-    state = load_state()
-    now = time.time()
-    any_active = False
-
-    for session_dir in SESSIONS_DIR.iterdir():
-        if not session_dir.is_dir():
-            continue
-
-        session_id = session_dir.name
-        transcript_str = read_file(session_dir / "transcript")
-        if not transcript_str:
-            continue
-        transcript_path = Path(transcript_str)
-        if not transcript_path.exists():
-            # Transcript gone — clean up stale session after 1h
-            if now - session_dir.stat().st_mtime > 3600:
-                shutil.rmtree(session_dir, ignore_errors=True)
-                state["sessions"].pop(session_id, None)
-            continue
-
-        any_active = True
-
-        # Activity = max of transcript mtime and any explicit activity touches
-        activity_file = session_dir / "last_activity"
-        last_activity = transcript_path.stat().st_mtime
-        if activity_file.exists():
-            last_activity = max(last_activity, activity_file.stat().st_mtime)
-
-        inactive_secs = now - last_activity
-        context_pct, tokens_used = get_context_from_transcript(transcript_path)
-        countdown_secs = max(0.0, timeout_secs - inactive_secs)
-        armed = context_pct >= threshold
-
-        prev = state["sessions"].get(session_id, {})
-        compact_triggered = prev.get("compact_triggered", False)
-
-        state["sessions"][session_id] = {
-            "armed": armed,
-            "countdown_seconds": round(countdown_secs, 1),
-            "context_pct": context_pct,
-            "tokens_used": tokens_used,
-            "compact_triggered": compact_triggered,
-            "inactive_seconds": round(inactive_secs, 1),
-        }
-
-        if armed and inactive_secs >= timeout_secs and not compact_triggered:
-            log(
-                f"Auto-compact: session {session_id[:8]}... "
-                f"ctx={context_pct:.1f}% inactive={inactive_secs:.0f}s"
-            )
-            trigger_compact(session_dir, context_pct)
-            state["sessions"][session_id]["compact_triggered"] = True
-
-    state["last_updated"] = now
-    save_state(state)
-    return any_active
-
-
 # ── Daemon main loop ───────────────────────────────────────────────────────────
 
 def daemon():
-    # Bail if another daemon is already running (race-condition guard)
     if DAEMON_PID_FILE.exists():
         try:
             pid = int(DAEMON_PID_FILE.read_text().strip())
             if pid != os.getpid():
                 os.kill(pid, 0)
-                # Other daemon is alive
-                return
+                return  # Another daemon alive
         except (ValueError, ProcessLookupError):
             pass
 
@@ -351,20 +576,18 @@ def daemon():
 
     signal.signal(signal.SIGTERM, handle_exit)
     signal.signal(signal.SIGINT, handle_exit)
-
     log(f"Daemon started (PID {os.getpid()})")
 
     idle_ticks = 0
     while True:
         try:
             config = load_config()
-            had_activity = daemon_tick(config)
-            if had_activity:
+            had_sessions = daemon_tick(config)
+            if had_sessions:
                 idle_ticks = 0
             else:
                 idle_ticks += 1
-                # Exit after 10 min with no active sessions
-                if idle_ticks > 60:
+                if idle_ticks > 60:  # 10 min with no sessions
                     log("No active sessions — daemon exiting")
                     break
         except Exception as e:
@@ -374,10 +597,81 @@ def daemon():
     DAEMON_PID_FILE.unlink(missing_ok=True)
 
 
+def daemon_tick(config: dict) -> bool:
+    """Check all Claude Code sessions. Returns True if any active session found."""
+    timeout_secs = config["inactivity_timeout_minutes"] * 60.0
+    threshold = config["compact_threshold_percent"]
+
+    sessions = find_all_sessions()
+    if not sessions:
+        return False
+
+    state = load_state()
+    now = time.time()
+
+    for session in sessions:
+        session_id = session.get("sessionId", "")
+        pid = session.get("pid", 0)
+        if not session_id or not pid:
+            continue
+
+        # Get transcript path — prefer Stop hook recording, fall back to inferred path
+        transcript_path_str = read_file(TRANSCRIPT_DIR / session_id)
+        tp = Path(transcript_path_str) if transcript_path_str else infer_transcript_path(session)
+        ctx_win_str = read_file(TRANSCRIPT_DIR / f"{session_id}.ctxwin")
+        ctx_win = int(ctx_win_str) if ctx_win_str.isdigit() else 0
+        context_pct, tokens_used = 0.0, 0
+        if tp and tp.exists():
+            context_pct, tokens_used = get_context_from_transcript(tp, ctx_win)
+
+        idle_secs = idle_seconds(session)
+        countdown_secs = max(0.0, timeout_secs - idle_secs)
+        armed = context_pct >= threshold
+        status = session.get("status", "unknown")
+
+        prev = state["sessions"].get(session_id, {})
+        compact_triggered = prev.get("compact_triggered", False)
+
+        # deadline = absolute Unix timestamp when compact fires — statusline uses this
+        # for a live countdown that doesn't depend on daemon poll frequency
+        deadline = (now + countdown_secs) if armed else 0.0
+
+        state["sessions"][session_id] = {
+            "pid": pid,
+            "status": status,
+            "armed": armed,
+            "deadline": round(deadline, 3),
+            "countdown_seconds": round(countdown_secs, 1),  # kept for status cmd
+            "context_pct": context_pct,
+            "tokens_used": tokens_used,
+            "compact_triggered": compact_triggered,
+            "idle_seconds": round(idle_secs, 1),
+        }
+
+        if armed and idle_secs >= timeout_secs and not compact_triggered:
+            log(
+                f"Auto-compact: session {session_id[:8]}... "
+                f"ctx={context_pct:.1f}% idle={idle_secs:.0f}s"
+            )
+            trigger_compact(session, context_pct)
+            state["sessions"][session_id]["compact_triggered"] = True
+
+    # Clean up state entries for sessions that no longer exist
+    active_ids = {s.get("sessionId") for s in sessions}
+    for sid in list(state["sessions"].keys()):
+        if sid not in active_ids:
+            state["sessions"].pop(sid, None)
+
+    state["last_updated"] = now
+    state["threshold"] = threshold  # statusline reads this to show "auto-compact at X%"
+    save_state(state)
+    return True
+
+
 # ── Stop hook ──────────────────────────────────────────────────────────────────
 
 def stop_hook():
-    """Called by Claude Code's Stop event. Stdin: JSON with session_id + transcript_path."""
+    """Called by Claude Code's Stop event. Records transcript path, outputs status."""
     try:
         data = json.load(sys.stdin)
     except Exception:
@@ -388,35 +682,26 @@ def stop_hook():
     if not session_id or not transcript_path:
         return
 
-    session_dir = SESSIONS_DIR / session_id
-    session_dir.mkdir(parents=True, exist_ok=True)
+    # Record transcript path and context window size so daemon can calculate context %
+    write_file(TRANSCRIPT_DIR / session_id, transcript_path)
+    ctx_win = data.get("context_window", {}).get("context_window_size", 0)
+    if ctx_win:
+        write_file(TRANSCRIPT_DIR / f"{session_id}.ctxwin", str(ctx_win))
 
-    # Record session info
-    write_file(session_dir / "transcript", transcript_path)
-
-    # Record tmux pane if available (used to send /compact)
-    tmux_pane = os.environ.get("TMUX_PANE", "")
-    if tmux_pane:
-        write_file(session_dir / "tmux_pane", tmux_pane)
-        # Write current-session pointer for optional tmux pane-focus hook
-        write_file(BASE_DIR / "current-session", session_id)
-
-    # Clear the compact-triggered flag — new interaction means new timer cycle
-    write_file(session_dir / "compacted", "")
+    # Reset compact_triggered so we can compact again after a new conversation cycle
     state = load_state()
     if session_id in state.get("sessions", {}):
         state["sessions"][session_id]["compact_triggered"] = False
         save_state(state)
 
-    # Start daemon if it isn't running
+    # Start daemon if not running
     ensure_daemon_running()
 
-    # Output a compact-status line into Claude's context
+    # Output status into Claude's context
     config = load_config()
     threshold = config["compact_threshold_percent"]
     timeout_min = config["inactivity_timeout_minutes"]
 
-    # Get context % — prefer state file (daemon already calculated it), else compute now
     session_state = state.get("sessions", {}).get(session_id, {})
     context_pct = session_state.get("context_pct", 0.0)
     if context_pct == 0.0:
@@ -427,13 +712,16 @@ def stop_hook():
             f"[better-compact] ⏱ Context {context_pct:.1f}% ≥ {threshold}% — "
             f"auto-compact fires in {timeout_min}m if session goes idle"
         )
-    # Below threshold: stay silent
 
 
 # ── PreToolUse hook ────────────────────────────────────────────────────────────
 
 def pre_tool_hook():
-    """Called by Claude Code's PreToolUse event. Resets inactivity by touching activity file."""
+    """
+    Called by Claude Code's PreToolUse event.
+    Claude Code natively updates session status to "busy" on activity,
+    so this mainly resets compact_triggered.
+    """
     try:
         data = json.load(sys.stdin)
     except Exception:
@@ -443,15 +731,6 @@ def pre_tool_hook():
     if not session_id:
         return
 
-    session_dir = SESSIONS_DIR / session_id
-    if not session_dir.exists():
-        return
-
-    # Touch activity file to reset the inactivity clock
-    activity_file = session_dir / "last_activity"
-    activity_file.touch()
-
-    # Also clear compact_triggered in state so we can compact again after resuming
     state = load_state()
     if session_id in state.get("sessions", {}):
         state["sessions"][session_id]["compact_triggered"] = False
@@ -472,34 +751,48 @@ def show_status():
     print(f"  Daemon             : {'running' if is_daemon_running() else 'stopped'}")
     print()
 
+    sessions = find_all_sessions()
     state = load_state()
-    sessions = state.get("sessions", {})
+
     if not sessions:
-        print("  No tracked sessions.")
+        print("  No active Claude Code sessions.")
         return
 
-    for sid, s in sessions.items():
-        ctx = s.get("context_pct", 0)
-        countdown = s.get("countdown_seconds", 0)
-        inactive = s.get("inactive_seconds", 0)
-        armed = s.get("armed", False)
-        triggered = s.get("compact_triggered", False)
+    for session in sessions:
+        session_id = session.get("sessionId", "?")
+        pid = session.get("pid", "?")
+        status = session.get("status", "?")
+        idle_secs = idle_seconds(session)
+        cwd = session.get("cwd", "?")
+        tmux_info = session.get("tmux", "")
 
-        mins, secs = divmod(int(inactive), 60)
-        status = "idle"
+        s = state.get("sessions", {}).get(session_id, {})
+        ctx = s.get("context_pct", 0.0)
+        countdown = s.get("countdown_seconds", timeout_secs)
+        triggered = s.get("compact_triggered", False)
+        armed = ctx >= threshold
+
+        mins, secs = divmod(int(idle_secs), 60)
+        compact_status = "idle"
         if triggered:
-            status = "compact sent"
-        elif armed and countdown == 0:
-            status = "COMPACT PENDING"
+            compact_status = "compact sent ✓"
+        elif armed and idle_secs >= timeout_secs:
+            compact_status = "COMPACT PENDING"
         elif armed:
             cm, cs = divmod(int(countdown), 60)
-            status = f"armed — compact in {cm}m {cs}s"
+            compact_status = f"armed — compact in {cm}m {cs}s"
+        elif ctx > 0:
+            compact_status = f"below threshold ({threshold}%)"
 
-        print(f"  Session {sid[:8]}...")
-        print(f"    Context: {ctx:.1f}%  |  Inactive: {mins}m {secs}s  |  {status}")
+        print(f"  PID {pid} | {Path(cwd).name}")
+        print(f"    Status   : {status} | Idle: {mins}m {secs}s")
+        print(f"    Context  : {ctx:.1f}% | {compact_status}")
+        if tmux_info:
+            print(f"    Tmux     : {tmux_info}")
+        print()
 
 
-# ── Install / uninstall ────────────────────────────────────────────────────────
+# ── Install / Uninstall ────────────────────────────────────────────────────────
 
 def _update_settings(settings_file: Path, installed_script: Path, statusline_script: Path):
     settings = {}
@@ -537,7 +830,6 @@ def _update_settings(settings_file: Path, installed_script: Path, statusline_scr
             "hooks": [{"type": "command", "command": pre_cmd}],
         })
 
-    # Backup existing statusLine and install ours
     if "statusLine" in settings and "_bc_statusline_backup" not in settings:
         settings["_bc_statusline_backup"] = settings["statusLine"]
     settings["statusLine"] = {
@@ -552,14 +844,12 @@ def _update_settings(settings_file: Path, installed_script: Path, statusline_scr
 def _remove_from_settings(settings_file: Path, installed_script: Path):
     if not settings_file.exists():
         return
-
     try:
         settings = json.loads(settings_file.read_text())
     except Exception:
         return
 
     hooks = settings.get("hooks", {})
-
     for event in ("Stop", "PreToolUse"):
         entries = hooks.get(event, [])
         new_entries = []
@@ -570,18 +860,14 @@ def _remove_from_settings(settings_file: Path, installed_script: Path):
             ]
             if filtered:
                 new_entries.append({**entry, "hooks": filtered})
-            elif entry.get("matcher") or len(entry.get("hooks", [])) > len(filtered):
-                pass  # drop entirely if all hooks were ours
         hooks[event] = new_entries
 
-    # Restore original statusLine if we backed it up
     backup = settings.pop("_bc_statusline_backup", None)
     if backup is not None:
         settings["statusLine"] = backup
     elif "statusLine" in settings:
-        # Remove ours only if it points to our script
         sl = settings.get("statusLine", {})
-        if str(installed_script).replace("better_compact.py", "statusline.js") in sl.get("command", ""):
+        if "better-compact" in sl.get("command", ""):
             del settings["statusLine"]
 
     settings_file.write_text(json.dumps(settings, indent=2))
@@ -594,16 +880,15 @@ def install_main():
     print("=" * 40)
     print()
 
-    # Gather config
     try:
-        timeout_input = input("Inactivity timeout before auto-compact (minutes) [5]: ").strip()
-        timeout = int(timeout_input) if timeout_input else 5
+        t = input("Inactivity timeout before auto-compact (minutes) [5]: ").strip()
+        timeout = int(t) if t else 5
     except (ValueError, EOFError):
         timeout = 5
 
     try:
-        threshold_input = input("Minimum context usage to trigger compact (%) [70]: ").strip()
-        threshold = int(threshold_input) if threshold_input else 70
+        th = input("Minimum context usage to trigger compact (%) [70]: ").strip()
+        threshold = int(th) if th else 70
     except (ValueError, EOFError):
         threshold = 70
 
@@ -611,9 +896,8 @@ def install_main():
 
     install_dir = BASE_DIR / "src"
     install_dir.mkdir(parents=True, exist_ok=True)
-    (BASE_DIR / "sessions").mkdir(exist_ok=True)
+    (BASE_DIR / "transcripts").mkdir(exist_ok=True)
 
-    # Write config
     config = {
         "inactivity_timeout_minutes": timeout,
         "compact_threshold_percent": threshold,
@@ -622,7 +906,6 @@ def install_main():
     CONFIG_FILE.write_text(json.dumps(config, indent=2))
     print(f"  Config written: {CONFIG_FILE}")
 
-    # Copy scripts from repo src/ → install dir
     repo_src = Path(__file__).parent
     for fname in ("better_compact.py", "statusline.js"):
         src = repo_src / fname
@@ -637,7 +920,6 @@ def install_main():
     installed_script = install_dir / "better_compact.py"
     statusline_script = install_dir / "statusline.js"
 
-    # Update ~/.claude/settings.json
     settings_file = Path.home() / ".claude" / "settings.json"
     _update_settings(settings_file, installed_script, statusline_script)
 
@@ -657,7 +939,6 @@ def uninstall_main():
     print("Uninstalling Better Auto-Compact...")
     print()
 
-    # Kill daemon if running
     if is_daemon_running():
         try:
             pid = int(DAEMON_PID_FILE.read_text().strip())
@@ -670,7 +951,6 @@ def uninstall_main():
     settings_file = Path.home() / ".claude" / "settings.json"
     _remove_from_settings(settings_file, installed_script)
 
-    # Remove our files
     if BASE_DIR.exists():
         shutil.rmtree(BASE_DIR, ignore_errors=True)
         print(f"  Removed {BASE_DIR}")
