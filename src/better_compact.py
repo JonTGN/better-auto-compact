@@ -50,7 +50,7 @@ def context_window_for_model(model_id: str) -> int:
 
 DEFAULT_CONFIG = {
     "inactivity_timeout_minutes": 5,
-    "compact_threshold_percent": 70,
+    "compact_threshold_percent": 50,
     "version": "1.0.0",
 }
 
@@ -887,10 +887,10 @@ def install_main():
         timeout = 5
 
     try:
-        th = input("Minimum context usage to trigger compact (%) [70]: ").strip()
-        threshold = int(th) if th else 70
+        th = input("Minimum context usage to trigger compact (%) [50]: ").strip()
+        threshold = int(th) if th else 50
     except (ValueError, EOFError):
-        threshold = 70
+        threshold = 50
 
     print()
 
@@ -928,6 +928,7 @@ def install_main():
     print()
     print(f"  Inactivity timeout : {timeout} minutes")
     print(f"  Compact threshold  : {threshold}%")
+
     print()
     print("Start a new Claude Code session to activate.")
     print(f"Run `python3 {installed_script} status` to check status.")
